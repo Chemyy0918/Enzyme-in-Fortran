@@ -26,6 +26,7 @@ This is the core dynamic library for Enzyme automatic differentiation.
 # Implementation Workflow
 ## A Simple Example to Form a First Impression
 The interface of Enzyme in C is very simple. Here is the simplest C code implementing Enzyme:
+
 example1.c
 ```c
 #include <stdio.h>
@@ -45,6 +46,7 @@ int main()
 Enzyme's logic for performing automatic differentiation is: declare a mysterious function `__enzyme_autodiff` in the code. Its first argument is a pointer to the function to be differentiated, the second argument is the value of the independent variable, and the function is expected to return the derivative at that point. Wherever the derivative is needed, `__enzyme_autodiff` is called directly.
 **The next step is the most mysterious: after compilation to LLVM IR, this mysterious function name will be preserved. Then the LLVM IR optimizer replaces the mysterious function with the derivative function, and at compile time the Enzyme dynamic library is automatically linked to differentiate the given function.**
 In Fortran, we need to use the `ISO_C_BINDING` module to call this mysterious function just like any external C library function, noting that the syntax for interacting with C is slightly different from native Fortran.
+
 example2.f95
 ```fortran
 MODULE FUNC_TEST
