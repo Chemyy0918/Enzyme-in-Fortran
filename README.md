@@ -9,7 +9,7 @@ Enzyme是一个可对LLVM IR做自动微分的高性能框架，只要源代码�
 我们需要确保Fortran源码能够被翻译成LLVM IR，因此我们需要Fortran的LLVM编译器`flang`。根据我的不完全调研，目前在网上基本上没有可开箱即用的预编译`flang`，就算能在某些包管理器中下载到`flang`，也可能缺少运行库。因此，我们需要从github上[下载](https://github.com/llvm/llvm-project)并[编译](https://llvm.org/docs/GettingStarted.html#getting-the-source-code-and-building-llvm)编译器。编译配置采用`cmake`，生成器建议使用`ninja`，变量`LLVM_ENABLE_PROJECTS` 里需要加入`flang` 字段，默认行为中只有C/C++语言的编译器`clang` 。
 这里不详述具体的编译过程，整个LLVM包体很大，`clang`本身是必须要有，加上`flang`以及其他运行时支持共有7000多个文件需要编译。如果你的CPU单核性能不够强劲，整个过程将会非常漫长。
 编译完成后，将flang加入环境变量，运行
-```
+```bash
 clang --version
 flang --version
 ```
@@ -24,8 +24,9 @@ LLVMEnzyme-<VERSION>.so
 # 实现流程
 ## 构成第一印象的简单例子
 Enzyme在C里的接口很简单，这是Enzyme在C中最简单的代码实现：
+
 example1.c
-```
+```c
 #include <stdio.h>
 double square(double x)
 {
@@ -43,8 +44,9 @@ int main()
 Enzyme实现自动微分的逻辑是，在代码中声明一个神秘函数`__enzyme_autodiff`，第一个输入是待求导函数的指针，第二个输入是自变量的值，函数预期输出该值处的导数。在需要计算导数的地方，直接把`__enzyme_autodiff`当作函数调用。
 **接下来就是最神秘的一步，编译到LLVM IR后，这个神秘函数名将会保留下来，随后LLVM IR优化器会将神秘函数替换成导函数，编译时自动链接Enzyme动态库实现对给定函数求导。**
 在Fortran中，需要使用`ISO_C_BINDING`模块像正常调用外部C库函数那样调用这个神秘函数，需注意与C交互时的语法和原生Fortran略有差别。
+
 example2.f95
-```
+```fortran
 MODULE FUNC_TEST
     CONTAINS
     FUNCTION SQUARE(X) BIND(C) RESULT(Y)
@@ -77,17 +79,17 @@ PROGRAM MAIN
 END PROGRAM
 ```
 执行
-```
+```bash
 flang example2.f95 -S -emit-llvm
 ```
 会生成`example2.ll`和两个模块文件，再执行
-```
+```bash
 opt example2.ll --load-pass-plugin=/to/your/LLVMEnzyme-<VERSION>.so --passes enzyme -S -o example2_opt.ll
 ```
 会生成`example2_opt.ll`
 这时可以执行`llvm-diff`，查看上述两个文件有什么区别
-```
-llvm example2.ll example2_opt.ll
+```bash
+llvm-diff example2.ll example2_opt.ll
 ```
 输出
 ```
@@ -102,7 +104,7 @@ in function _QQmain:
 ```
 可以看到原本调用`__enzyme_autodiff`的位置变成了`diffsquare`。
 最后将`example2_opt.ll`编译到机器码即可正常运行
-```
+```bash
 flang example2_opt.ll -o example2
 ./example2
 ```
