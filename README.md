@@ -160,13 +160,17 @@ extern "C"
 `grad_fn`是一个包裹`__enzyme_autodiff`的函数，有五个输入，相比`fn`来说多了一个数组`GRAD_X`用于储存导数。
 考虑到各个参量的类型，`X`和`GRAD_X`需要指定`enzyme_dup`，其他都是`enzyme_const`。在这里不使用`enzyme_out`的考量是，**Fortran不能直接通过C接口接收一个数组类型的函数返回值，只能通过子程序`SUBROUTINE`取得数组。**
 一个简单的多元含参Fortran例子是
+
 $$
 f(x,y)=axy+\frac{b}{y}
 $$
+
 梯度是
+
 $$
 (\frac{\partial f}{\partial x},\frac{\partial f}{\partial y})=(ay,ax-\frac{b}{y^2})
 $$
+
 example3.f95
 ```fortran
 MODULE FUNC_TEST
@@ -212,16 +216,21 @@ PROGRAM MAIN
 END PROGRAM MAIN
 ```
 此例中，
+
 $$
 a=1,b=1,x=2,y=3
 $$
+
 那么
+
 $$
 f(x,y)=xy+\frac{1}{y}
 $$
+
 $$
 (\frac{\partial f}{\partial x},\frac{\partial f}{\partial y})=(y,x-\frac{1}{y^2})
 $$
+
 按如下步骤链接与编译
 ```bash
 flang example3.f03 -emit-llvm -S
