@@ -114,5 +114,149 @@ Output:
 ```
 square'( 3.14 )= 6.28
 ```
-# TODO LIST
-For multivariate functions with parameters, the parameters should be treated as constants, and partial derivatives with respect to different independent variables are needed. Enzyme does have relevant mechanisms, but they are more complex and will be discussed in the future.
+## Gradient of Arbitrary Multivariate Parametric Functions
+Once multivariate parametric functions are involved, a pure C interface is no longer sufficient. It becomes necessary to write a C++ wrapper and expose a C-compatible interface so that Fortran can use automatic differentiation via standard C interoperability syntax.
+Since Enzyme operates at the LLVM level, it is not possible to simply compile C++ code into a static or shared library (.a or .so) and link it during Fortran compilation. Instead, one possible approach is to compile each component separately into LLVM IR, then use llvm-link to merge them into a single mixed IR module. This combined IR can then be processed by opt to apply Enzyme’s automatic differentiation passes at the IR level. Finally, flang can be used to compile the optimized IR into an executable.
+First, we briefly introduce the C++ interface syntax of Enzyme:
+```c++
+double* x, dx;
+double y, dy;
+double a;
+int enzyme_dup, enzyme_out, enzyme_const;
+
+dy = __enzyme_autodiff(
+    (void*)func,
+    enzyme_dup, x, dx,
+    enzyme_out, y,
+    enzyme_const, a
+);
+```
+This syntax originates from Enzyme’s classification of all arguments (except the function pointer) into three categories:
+
+1. Duplicated variables.These are input variables for which derivatives are computed. Two arrays are provided: x and dx. x specifies the primal input, while dx stores the gradients and must be initialized to zero. After autodiff, dx contains the derivative of the function evaluated at x.
+2. Output variables .These are scalar outputs such as y. Their derivatives (dy) are returned as results of the autodiff call.
+3. Inactive (constant) variables.These inputs, such as array a, are treated as constants and are not differentiated.
+The argument types are specified using `enzyme_dup`, `enzyme_out`, and `enzyme_const` respectively.
+A **significant** issue arises here: although Fortran can pass function pointers to C, such pointers are opaque to Enzyme. As a result, Enzyme cannot inspect the internal implementation of the function and therefore cannot perform automatic differentiation.
+There are two possible solutions:
+The first is to implement the function entirely inside a C++ wrapper. This makes the function fully visible to Enzyme. However, the original goal of this project is to add automatic differentiation capabilities to existing legacy Fortran code with minimal modification, rather than rewriting everything in C++. Moreover, if this were the approach, one might just as well use Julia directly, since Enzyme.jl already provides a much more convenient workflow.
+The second approach is to bind the Fortran function using bind(C) and expose it under a C-visible symbol name. This symbol is then passed directly into `__enzyme_autodiff`. In the merged LLVM IR, Enzyme is able to see the full function definition and perform differentiation.
+In this work, the second approach is preferred. A potential limitation is that when multiple functions in Fortran require differentiation, each `__enzyme_autodiff` call can only target a single function. As a result, multiple wrapper functions must be written, each corresponding to a different differentiated function.
+One possible implementation of the C++ wrapper is shown below:
+enzyme_wrap.cpp
+```c++
+extern "C"
+{
+    void __enzyme_autodiff(void*, ...);
+    int enzyme_dup;
+    int enzyme_const;
+
+    double fn(double*, double*, int, int);
+
+    void grad_fn(double* X, double* GRAD_X, double* P, int SIZE_X, int SIZE_P)
+    {
+        __enzyme_autodiff((void*)fn,
+                          enzyme_dup, X, GRAD_X,
+                          enzyme_const, P,
+                          enzyme_const, SIZE_X,
+                          enzyme_const, SIZE_P);
+    }
+}
+```
+Here, double fn(double*, double*, int, int) declares the function to be differentiated. Its implementation resides in Fortran. It has five inputs: the first is the variable array X, the second is the parameter array P, the third is the size of X (SIZE_X), and the fourth is the size of P (SIZE_P).
+grad_fn is a wrapper around `__enzyme_autodiff`, taking five inputs. Compared to fn, it additionally includes GRAD_X, which stores the computed derivatives.
+Considering the argument types, X and GRAD_X are marked as `enzyme_dup`, while all other arguments are marked as enzyme_const. `enzyme_out` is not used here because **Fortran cannot directly receive array return values from C functions; arrays can only be handled via subroutines (SUBROUTINE).**
+A simple multivariate parametric Fortran example is:
+
+$$f(x,y) = a x y + b / y$$
+
+The gradient is:
+
+$$
+(\frac{\partial f}{\partial x},\frac{\partial f}{\partial y})=(ay,ax-\frac{b}{y^2})
+$$
+
+example3.f95
+```fortran
+MODULE FUNC_TEST
+    USE ISO_C_BINDING
+    IMPLICIT NONE
+    INTERFACE
+        SUBROUTINE GRAD(X,GRAD_X,P,SIZE_X,SIZE_P) BIND(C,NAME="grad_fn")
+            USE ISO_C_BINDING
+            IMPLICIT NONE
+            INTEGER(C_INT),INTENT(IN),VALUE::SIZE_X,SIZE_P
+            REAL(C_DOUBLE),INTENT(IN)::X(*),P(*)
+            REAL(C_DOUBLE),INTENT(OUT)::GRAD_X(*)
+        END SUBROUTINE
+    END INTERFACE
+    CONTAINS
+        FUNCTION FUNC(X,P,SIZE_X,SIZE_P) BIND(C,NAME="fn") RESULT(Y)
+            USE ISO_C_BINDING
+            IMPLICIT NONE
+            INTEGER(C_INT),INTENT(IN),VALUE::SIZE_X,SIZE_P
+            REAL(C_DOUBLE),INTENT(IN)::X(*),P(*)
+            REAL(C_DOUBLE)::Y
+            Y = P(1)*X(1)*X(2) + P(2)/X(2)
+        END FUNCTION
+END MODULE FUNC_TEST
+
+PROGRAM MAIN
+    USE ISO_C_BINDING
+    USE FUNC_TEST
+    IMPLICIT NONE
+    REAL(C_DOUBLE),ALLOCATABLE::X(:),P(:),GRAD_X(:)
+    REAL(C_DOUBLE)::Y
+    INTEGER(C_INT)::SIZE_X,SIZE_P
+
+    ALLOCATE(X(2),GRAD_X(2),P(2))
+
+    X = [2.,3.]
+    P = [1.,1.]
+    GRAD_X = 0.0D0
+
+    SIZE_X = SIZE(X)
+    SIZE_P = SIZE(P)
+
+    Y = FUNC(X,P,SIZE_X,SIZE_P)
+    CALL GRAD(X,GRAD_X,P,SIZE_X,SIZE_P)
+
+    PRINT *,"f(",X(1),",",X(2),")=",Y
+    PRINT *,"gradf(",X(1),",",X(2),")=(",GRAD_X(1),",",GRAD_X(2),")"
+
+    DEALLOCATE(X,GRAD_X,P)
+END PROGRAM MAIN
+```
+in this example, 
+
+$$
+a=1,b=1,x=2,y=3
+$$
+
+giving:
+
+$$
+f(x,y)=xy+\frac{1}{y}
+$$
+
+$$
+(\frac{\partial f}{\partial x},\frac{\partial f}{\partial y})=(y,x-\frac{1}{y^2})
+$$
+
+The compilation and linking steps are as follows:
+```bash
+flang example3.f03 -emit-llvm -S
+clang++ enzyme_wrap.cpp -emit-llvm -S
+llvm-link example3.ll enzyme_wrap.ll -S -o mixed.ll
+opt mixed.ll --load-pass-plugin=/to/your/enzyme.so --passes enzyme -S -o mixed_opt.ll
+flang mixed_opt.ll -o a.out
+```
+Execution yields:
+```
+f( 2. , 3. )= 6.333333333333333
+gradf( 2. , 3. )=( 3. , 1.8888888888888888 )
+```
+It can be seen that the gradient is correctly computed. By modifying X and P, gradients under different conditions can be obtained.
+## TODO LIST
+### Simple Application 1: Quasi-Newton Optimizer
+### Simple Application 2: Symplectic Dynamics
