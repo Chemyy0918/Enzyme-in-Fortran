@@ -112,5 +112,131 @@ flang example2_opt.ll -o example2
 ```
 square'( 3.14 )= 6.28
 ```
-# TODO LIST
-对于含参数的多元函数，参数应视作常数，对于不同自变量还需要求偏导，Enzyme确有相关机制处理，但是比较复杂，留待以后再讨论。
+## 任意多元含参函数的梯度
+一旦涉及到多元含参函数，C接口不再可行，必须写C++封装，并对外暴露C接口，让Fortran按调C库的语法使用自动微分。
+由于Enzyme是在LLVM层面上的自动微分，不能把C++封成.a或.so然后编Fortran的时候链接它，可以考虑把它们各自编译到LLVM IR后采用`llvm-link`，构成一段混合代码，再过`opt`对LLVM IR函数自动微分，最后用`flang`编译，得到可执行文件。
+首先简要介绍一下Enzyme的C++接口语法
+```c++
+double* x,dx;
+double y,dy;
+double a;
+int enzyme_dup,enzyme_out,enzyme_const;
+dy=__enzyme_autodiff(
+	(void*)func,
+	enzyme_dup,x,dx,
+	enzyme_out,y
+	enzyme_const,a
+	);
+```
+这样的语法源自Enzyme把除了函数指针以外的参数分为三类，他们分别是：
+1. Duplicated 复印变量 输入两个数组x和dx，x指明求导的位置，dx是存放梯度的数组(需要初始化为全0)，在运行autodiff之后，dx被赋值为在x点处的梯度值。
+2. Output 输出变量 输入一个数值y，它的导数dy以返回值的形式给出。
+3. Inactive 常量 输入一个数组a，它们作为参数存在，不需要求导。
+依次使用`enzyme_dup`,`enzyme_out`和`enzyme_const`指明各个变量的类型。
+接着，有一个**相当严峻**的问题，Fortran虽然可以向C传函数指针，但这种指针是不透明的，Enzyme看不到这个函数内部具体做了什么，也就不能实现自动微分。有两种解决方案：
+其一是在C++封装内写函数，这样对Enzyme来说是透明的，但是我们这个项目的初衷是赋予老Fortran项目自动微分的新功能，理应对Fortran代码做足够小的改动，而不是在C++里重写。而且，为什么我不写Julia程序呢，Enzyme.jl可是非常好用的；
+其二是在Fortran函数bind(C)的时候赋一个对C暴露的函数名，然后直接把这个函数名的指针写进autodiff，在混合的LLVM IR里，Enzyme能看到这个函数的具体实现。
+我这边考虑采用第二种。这个过程可能包含的缺陷是，当Fortran函数里有多个函数需要自动微分，一个__enzyme_autodiff只能管一个函数，于是便需要写很多个__enzyme_autodiff，作为不同函数的导函数。
+封装过的cpp代码的一种实现是：
+enzyme_wrap.cpp
+```c
+extern "C" 
+{
+    void __enzyme_autodiff(void*,...);
+    int enzyme_dup;
+    int enzyme_const;
+    double fn(double*,double*,int,int);
+    void grad_fn(double* X,double* GRAD_X,double* P,int SIZE_X,int SIZE_P)
+    {
+        __enzyme_autodiff((void*)fn,
+                          enzyme_dup,X,GRAD_X,
+                          enzyme_const,P,
+                          enzyme_const,SIZE_X,
+                          enzyme_const,SIZE_P);
+    }
+}
+```
+在这里`double fn(double*,double*,int,int)`是待微分函数的声明，具体实现在Fortran里，有五个输入，第一个输入是自变量数组`X`，第二个输入是常量构成的数组`P`，第三个是自变量数组的尺寸`SIZE_X`，第四个是常量数组的尺寸`SIZE_P`。
+`grad_fn`是一个包裹`__enzyme_autodiff`的函数，有五个输入，相比`fn`来说多了一个数组`GRAD_X`用于储存导数。
+考虑到各个参量的类型，`X`和`GRAD_X`需要指定`enzyme_dup`，其他都是`enzyme_const`。在这里不使用`enzyme_out`的考量是，**Fortran不能直接通过C接口接收一个数组类型的函数返回值，只能通过子程序`SUBROUTINE`取得数组。**
+一个简单的多元含参Fortran例子是
+$$
+f(x,y)=axy+\frac{b}{y}
+$$
+梯度是
+$$
+(\frac{\partial f}{\partial x},\frac{\partial f}{\partial y})=(ay,ax-\frac{b}{y^2})
+$$
+example3.f95
+```fortran
+MODULE FUNC_TEST
+    USE ISO_C_BINDING
+    IMPLICIT NONE
+    INTERFACE 
+        SUBROUTINE GRAD(X,GRAD_X,P,SIZE_X,SIZE_P) BIND(C,NAME="grad_fn")
+            USE ISO_C_BINDING
+            IMPLICIT NONE
+            INTEGER(C_INT),INTENT(IN),VALUE::SIZE_X,SIZE_P
+            REAL(C_DOUBLE),INTENT(IN)::X(*),P(*)
+            REAL(C_DOUBLE),INTENT(OUT)::GRAD_X(*)
+        END SUBROUTINE
+    END INTERFACE
+    CONTAINS
+        FUNCTION FUNC(X,P,SIZE_X,SIZE_P) BIND(C,NAME="fn") RESULT(Y)
+            USE ISO_C_BINDING
+            IMPLICIT NONE
+            INTEGER(C_INT),INTENT(IN),VALUE::SIZE_X,SIZE_P
+            REAL(C_DOUBLE),INTENT(IN)::X(*),P(*)
+            REAL(C_DOUBLE)::Y
+            Y=P(1)*X(1)*X(2)+P(2)/X(2)
+        END FUNCTION
+END MODULE FUNC_TEST
+PROGRAM MAIN
+    USE ISO_C_BINDING
+    USE FUNC_TEST
+    IMPLICIT NONE
+	REAL(C_DOUBLE),ALLOCATABLE::X(:),P(:),GRAD_X(:)
+    REAL(C_DOUBLE)::Y
+    INTEGER(C_INT)::SIZE_X,SIZE_P
+    ALLOCATE(X(2),GRAD_X(2),P(2))
+    X=[2.,3.]
+    P=[1.,1.]
+    GRAD_X=0.0D0
+    SIZE_X=SIZE(X)
+    SIZE_P=SIZE(P)
+    Y=FUNC(X,P,SIZE_X,SIZE_P)
+    CALL GRAD(X,GRAD_X,P,SIZE_X,SIZE_P)
+    PRINT *,"f(",X(1),",",X(2),")=",Y
+    PRINT *,"gradf(",X(1),",",X(2),")=(",GRAD_X(1),",",GRAD_X(2),")"
+    DEALLOCATE(X,GRAD_X,P)
+END PROGRAM MAIN
+```
+此例中，
+$$
+a=1,b=1,x=2,y=3
+$$
+那么
+$$
+f(x,y)=xy+\frac{1}{y}
+$$
+$$
+(\frac{\partial f}{\partial x},\frac{\partial f}{\partial y})=(y,x-\frac{1}{y^2})
+$$
+按如下步骤链接与编译
+```bash
+flang example3.f03 -emit-llvm -S
+clang++ enzyme_wrap.cpp -emit-llvm -S
+llvm-link example3.ll enzyme_wrap.ll -S -o mixed.ll
+opt mixed.ll --load-pass-plugin=/to/your/enzyme.so --passes enzyme -S -o mixed_opt.ll
+flang mixed_opt.ll -o a.out
+```
+执行可得
+``` 
+f( 2. , 3. )= 6.333333333333333
+gradf( 2. , 3. )=( 3. , 1.8888888888888888 )
+```
+可以看到正确地输出了梯度，修改`X`和`P`，可以得到各种情况下的梯度信息。
+
+## TODO LIST
+### 简单应用1：拟牛顿法优化器
+### 简单应用2：辛动力学
